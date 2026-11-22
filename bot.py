@@ -3,7 +3,7 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 import discord
-from discord.ext import commands
+from discord import app_commands
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,10 +15,15 @@ SINGLE_DELETE_DELAY_SECONDS = 1.1
 PROGRESS_UPDATE_INTERVAL_SECONDS = 10
 CONFIRM_TIMEOUT_SECONDS = 30
 
-intents = discord.Intents.default()
-intents.message_content = True
+class ClearBot(discord.Client):
+    def __init__(self):
+        super().__init__(intents=discord.Intents.default())
+        self.tree = app_commands.CommandTree(self)
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+    async def setup_hook(self):
+        await self.tree.sync()
+
+bot = ClearBot()
 
 active_clears = {}
 
@@ -39,7 +44,23 @@ class ProgressReporter:
 
     async def show_count(self):
         self.last_update = time.monotonic()
-        await self.status_message.edit(content=f"🗑️ Deleting... {self.deleted_count} messages so far. Type `!stop` to stop.")
+        await self.status_message.edit(content=f"🗑️ Deleting... {self.deleted_count} messages so far. Use `/stop` to stop.")
+
+class ConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=CONFIRM_TIMEOUT_SECONDS)
+        self.confirmed = False
+
+    @discord.ui.button(label="Yes, delete everything", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        self.confirmed = True
+        await interaction.response.edit_message(content="🗑️ Clearing the channel...", view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.edit_message(content="❌ Clear cancelled.", view=None)
+        self.stop()
 
 def is_bulk_deletable(message):
     cutoff = datetime.now(timezone.utc) - BULK_DELETE_MAX_AGE
@@ -79,37 +100,27 @@ async def delete_history(channel, amount, status_message, progress, stop_request
 
     await bulk_delete(channel, recent_messages, progress)
 
-async def cancel_prompt(prompt):
-    await prompt.edit(content="❌ Clear cancelled.")
-    await prompt.delete(delay=5)
+async def confirm_full_clear(interaction):
+    view = ConfirmView()
+    await interaction.response.send_message("⚠️ This deletes every message in this channel.", view=view, ephemeral=True)
 
-async def confirm_full_clear(ctx):
-    prompt = await ctx.send(f"⚠️ This deletes every message in this channel. Type `yes` within {CONFIRM_TIMEOUT_SECONDS} seconds to continue.")
+    timed_out = await view.wait()
+    if timed_out:
+        await interaction.edit_original_response(content="❌ Clear cancelled.", view=None)
 
-    def is_reply_from_author(message):
-        return message.author == ctx.author and message.channel == ctx.channel
+    return view.confirmed
 
-    try:
-        reply = await bot.wait_for("message", check=is_reply_from_author, timeout=CONFIRM_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        await cancel_prompt(prompt)
-        return False
-
-    if reply.content.strip().lower() != "yes":
-        await cancel_prompt(prompt)
-        return False
-
-    return True
-
-async def run_clear(ctx, amount, stop_requested):
-    if not amount:
-        confirmed = await confirm_full_clear(ctx)
+async def run_clear(interaction, amount, stop_requested):
+    if amount is None:
+        confirmed = await confirm_full_clear(interaction)
         if not confirmed:
             return
+    else:
+        await interaction.response.send_message(f"🗑️ Deleting the last {amount} messages...", ephemeral=True)
 
-    status_message = await ctx.send("🗑️ Deleting messages...")
+    status_message = await interaction.channel.send("🗑️ Deleting messages...")
     progress = ProgressReporter(status_message)
-    await delete_history(ctx.channel, amount, status_message, progress, stop_requested)
+    await delete_history(interaction.channel, amount, status_message, progress, stop_requested)
 
     if stop_requested.is_set():
         await status_message.edit(content=f"🛑 Stopped. Deleted {progress.deleted_count} messages.")
@@ -125,41 +136,42 @@ async def run_clear(ctx, amount, stop_requested):
 async def on_ready():
     print(f"Bot is online as {bot.user}")
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.BotMissingPermissions):
-        await ctx.send(f"⚠️ {error}", delete_after=10)
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    if isinstance(error, (app_commands.MissingPermissions, app_commands.BotMissingPermissions)):
+        await interaction.response.send_message(f"⚠️ {error}", ephemeral=True)
         return
-    await commands.Bot.on_command_error(bot, ctx, error)
+    await app_commands.CommandTree.on_error(bot.tree, interaction, error)
 
-@bot.command()
-@commands.has_permissions(manage_messages=True)
-@commands.bot_has_permissions(manage_messages=True, read_message_history=True)
-async def clear(ctx, amount: int = None):
-    await ctx.message.delete()
-
-    if ctx.channel.id in active_clears:
-        await ctx.send("⏳ A clear is already running in this channel.", delete_after=5)
+@bot.tree.command(name="clear", description="Delete messages in this channel.")
+@app_commands.describe(amount="How many recent messages to delete. Leave empty to delete all.")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.checks.has_permissions(manage_messages=True)
+@app_commands.checks.bot_has_permissions(manage_messages=True, read_message_history=True, send_messages=True)
+async def clear(interaction: discord.Interaction, amount: app_commands.Range[int, 1] = None):
+    if interaction.channel_id in active_clears:
+        await interaction.response.send_message("⏳ A clear is already running in this channel.", ephemeral=True)
         return
 
     stop_requested = asyncio.Event()
-    active_clears[ctx.channel.id] = stop_requested
+    active_clears[interaction.channel_id] = stop_requested
     try:
-        await run_clear(ctx, amount, stop_requested)
+        await run_clear(interaction, amount, stop_requested)
     finally:
-        del active_clears[ctx.channel.id]
+        del active_clears[interaction.channel_id]
 
-@bot.command()
-@commands.has_permissions(manage_messages=True)
-@commands.bot_has_permissions(manage_messages=True)
-async def stop(ctx):
-    await ctx.message.delete()
-
-    stop_requested = active_clears.get(ctx.channel.id)
+@bot.tree.command(name="stop", description="Stop the running clear in this channel.")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def stop(interaction: discord.Interaction):
+    stop_requested = active_clears.get(interaction.channel_id)
     if stop_requested is None:
-        await ctx.send("ℹ️ No clear is running in this channel.", delete_after=5)
+        await interaction.response.send_message("ℹ️ No clear is running in this channel.", ephemeral=True)
         return
 
     stop_requested.set()
+    await interaction.response.send_message("🛑 Stopping...", ephemeral=True)
 
 bot.run(TOKEN)

@@ -19,7 +19,6 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-
 class ProgressReporter:
     def __init__(self, status_message):
         self.status_message = status_message
@@ -28,24 +27,26 @@ class ProgressReporter:
 
     async def add(self, count):
         self.deleted_count += count
-        now = time.monotonic()
-        if now - self.last_update < PROGRESS_UPDATE_INTERVAL_SECONDS:
-            return
-        self.last_update = now
-        await self.status_message.edit(content=f"🗑️ Deleting... {self.deleted_count} messages so far.")
+        if self.is_update_due():
+            await self.show_count()
 
+    def is_update_due(self):
+        seconds_since_update = time.monotonic() - self.last_update
+        return seconds_since_update >= PROGRESS_UPDATE_INTERVAL_SECONDS
+
+    async def show_count(self):
+        self.last_update = time.monotonic()
+        await self.status_message.edit(content=f"🗑️ Deleting... {self.deleted_count} messages so far.")
 
 def is_bulk_deletable(message):
     cutoff = datetime.now(timezone.utc) - BULK_DELETE_MAX_AGE
     return message.created_at > cutoff
-
 
 async def bulk_delete(channel, messages, progress):
     if not messages:
         return
     await channel.delete_messages(messages)
     await progress.add(len(messages))
-
 
 async def single_delete(message, progress):
     try:
@@ -55,24 +56,22 @@ async def single_delete(message, progress):
     await progress.add(1)
     await asyncio.sleep(SINGLE_DELETE_DELAY_SECONDS)
 
-
 async def delete_history(channel, amount, status_message, progress):
-    bulk_batch = []
+    recent_messages = []
 
     async for message in channel.history(limit=amount, before=status_message):
         if is_bulk_deletable(message):
-            bulk_batch.append(message)
-            if len(bulk_batch) == BULK_DELETE_BATCH_SIZE:
-                await bulk_delete(channel, bulk_batch, progress)
-                bulk_batch = []
-            continue
+            recent_messages.append(message)
+        else:
+            await bulk_delete(channel, recent_messages, progress)
+            recent_messages = []
+            await single_delete(message, progress)
 
-        await bulk_delete(channel, bulk_batch, progress)
-        bulk_batch = []
-        await single_delete(message, progress)
+        if len(recent_messages) == BULK_DELETE_BATCH_SIZE:
+            await bulk_delete(channel, recent_messages, progress)
+            recent_messages = []
 
-    await bulk_delete(channel, bulk_batch, progress)
-
+    await bulk_delete(channel, recent_messages, progress)
 
 @bot.event
 async def on_ready():
